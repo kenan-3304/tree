@@ -60,6 +60,7 @@ app.post('/vapi-webhook', async (req, res) => {
         // Smart Phone Number Logic
         const extractedPhone = sanitize(structuredData.callback_number);
         const callerId = sanitize(customer.number);
+        const dialedNumber = callData.phone_number || ''; // The Vapi number called
 
         let phoneNumber = callerId;
         // If extractedPhone looks like a real number (7+ digits), prefer it
@@ -77,7 +78,7 @@ app.post('/vapi-webhook', async (req, res) => {
 
         // SCENARIO A: SUCCESS - We have an address
         if (address && address.length > 5) {
-            const leadSummary = `✅ NEW LEAD: ${name} needs ${serviceType} at ${address}. Urgency: ${urgency}. Phone: ${phoneNumber}`;
+            const leadSummary = `✅ NEW LEAD: ${name} needs ${serviceType} at ${address}. Urgency: ${urgency}. Phone: ${phoneNumber}. Called: ${dialedNumber}`;
 
             // Determine Recipient based on Assistant ID
             const assistantId = callData.assistantId;
@@ -118,8 +119,10 @@ app.post('/vapi-webhook', async (req, res) => {
 
                 // SAVE TO REDIS (24h Expiry)
                 if (ownerPhone) {
-                    await redis.set(phoneNumber, ownerPhone, { ex: 86400 });
-                    console.log(`Saved pending rescue to Redis for ${phoneNumber}.`);
+                    // Store as JSON to include dialed number for tracking
+                    const redisValue = JSON.stringify({ ownerPhone, dialedNumber });
+                    await redis.set(phoneNumber, redisValue, { ex: 86400 });
+                    console.log(`Saved pending rescue to Redis for ${phoneNumber} (Owner: ${ownerPhone}, Dialed: ${dialedNumber}).`);
                 }
 
             } catch (e) {
@@ -141,11 +144,24 @@ app.post('/twilio-sms-reply', async (req, res) => {
     console.log(`Received SMS from ${customerPhone}: ${customerMsg}`);
 
     // 1. Lookup Owner in Redis
-    const ownerPhone = await redis.get(customerPhone);
+    const redisData = await redis.get(customerPhone);
 
-    if (!ownerPhone) {
+    if (!redisData) {
         console.log("No pending rescue found for this number.");
         return res.sendStatus(200);
+    }
+
+    // Parse JSON data (backwards compatibility check for plain string not strictly necessary if we just deployed, but good practice if mixed data existed, assuming fresh start though)
+    let ownerPhone;
+    let dialedNumber;
+
+    try {
+        const parsed = JSON.parse(redisData);
+        ownerPhone = parsed.ownerPhone;
+        dialedNumber = parsed.dialedNumber;
+    } catch (e) {
+        // Fallback if it was just a plain string (legacy)
+        ownerPhone = redisData;
     }
 
     // 2. Ask OpenAI to extract address
