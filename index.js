@@ -1,38 +1,200 @@
 const express = require('express');
 const twilio = require('twilio');
 const bodyParser = require('body-parser');
+const { OpenAI } = require('openai');
 
 const app = express();
+app.use(bodyParser.urlencoded({ extended: false })); // Twilio sends form-urlencoded
 app.use(bodyParser.json());
 
 const client = new twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH);
-const OWNER_PHONE = process.env.OWNER_PHONE; // The Tree Service Guy's Phone
-const TWILIO_NUM = process.env.TWILIO_NUM;   // Your Twilio Number
+
+// Initialize Supabase & OpenAI
+// Initialize Redis & OpenAI
+const { Redis } = require('@upstash/redis');
+const redis = new Redis({
+    url: process.env.UPSTASH_REDIS_REST_URL,
+    token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// Hardcoded Values & Directory
+const YOUR_844_NUMBER = '+18443336529'; // Your Toll-Free (844) Number
+
+// Map Vapi Assistant IDs to Owner Phone Numbers
+const COMPANY_DIRECTORY = {
+    // Extracted from Python example: 9337f242... -> 7037760484
+    "bb86db5d-7dcc-444f-bebd-0019265f857f": "+17037760484",
+    // Add more assistants here
+};
+
+// Helper to clean "null" strings from AI
+const sanitize = (value) => {
+    if (!value) return null;
+    if (typeof value === 'string') {
+        const cleaned = value.trim();
+        if (["null", "n/a", "none", "unknown", "undefined"].includes(cleaned.toLowerCase())) {
+            return null;
+        }
+        return cleaned;
+    }
+    return value;
+};
 
 app.post('/vapi-webhook', async (req, res) => {
     const payload = req.body.message;
 
     // Vapi sends "end-of-call-report" when the call finishes
-    if (payload.type === 'end-of-call-report') {
-        const data = payload.analysis.structuredData;
-        const customerNum = payload.customer.number;
+    if (payload && payload.type === 'end-of-call-report') {
+        const analysis = payload.analysis || {};
+        const structuredData = analysis.structuredData || {};
+        const callData = payload.call || {};
+        const customer = callData.customer || {};
 
-        // 1. SUCCESS BRANCH: We got the address
-        if (data && data.address && data.address.length > 5) {
-            const leadSummary = `✅ NEW LEAD: ${data.name || 'Unknown'} needs ${data.service_type || 'service'} at ${data.address}. Urgency: ${data.urgency || 'Normal'}.`;
+        // 1. EXTRACT DATA & SANITIZE
+        const address = sanitize(structuredData.address);
+        const name = sanitize(structuredData.name) || 'Unknown';
+        const urgency = sanitize(structuredData.urgency) || 'Normal';
+        const serviceType = sanitize(structuredData.service_type) || 'service';
 
-            await client.messages.create({ body: leadSummary, from: TWILIO_NUM, to: OWNER_PHONE });
-            console.log("Success text sent to owner.");
+        // Smart Phone Number Logic
+        const extractedPhone = sanitize(structuredData.callback_number);
+        const callerId = sanitize(customer.number);
+
+        let phoneNumber = callerId;
+        // If extractedPhone looks like a real number (7+ digits), prefer it
+        if (extractedPhone && /\d{7,}/.test(extractedPhone)) {
+            phoneNumber = extractedPhone;
         }
-        // 2. RESCUE BRANCH: No address (hangup/garbled)
-        else {
-            const rescueMsg = "Hey, this is [Company Name]. Looks like we got disconnected—what was the address for that tree work and what do you need done?";
 
-            await client.messages.create({ body: rescueMsg, from: TWILIO_NUM, to: customerNum });
-            console.log("Rescue text sent to customer.");
+        // 2. LOGIC BRANCHES
+
+        // GHOST CALL CHECK: If no address AND no valid phone, skip
+        if (!address && !phoneNumber) {
+            console.log("Skipping Ghost Call: No Address and No Phone Number.");
+            return res.sendStatus(200);
+        }
+
+        // SCENARIO A: SUCCESS - We have an address
+        if (address && address.length > 5) {
+            const leadSummary = `✅ NEW LEAD: ${name} needs ${serviceType} at ${address}. Urgency: ${urgency}. Phone: ${phoneNumber}`;
+
+            // Determine Recipient based on Assistant ID
+            const assistantId = callData.assistantId;
+            const ownerPhone = COMPANY_DIRECTORY[assistantId];
+
+            if (ownerPhone) {
+                try {
+                    // Send details to the business owner
+                    await client.messages.create({
+                        body: leadSummary,
+                        from: YOUR_844_NUMBER,
+                        to: ownerPhone
+                    });
+                    console.log(`Success text sent to owner (${ownerPhone}).`);
+                } catch (e) {
+                    console.error("Error sending success text:", e);
+                }
+            } else {
+                console.log(`No owner found for Assistant ID: ${assistantId}`);
+            }
+        }
+        // SCENARIO B: RESCUE - Address is missing
+        else {
+            const rescueMsg = "Hey! We missed the address on that call. Where is the tree located so we can get you a quote?";
+
+            // Determine Recipient based on Assistant ID
+            const assistantId = callData.assistantId;
+            const ownerPhone = COMPANY_DIRECTORY[assistantId];
+
+            try {
+                // Send rescue text to the customer
+                await client.messages.create({
+                    body: rescueMsg,
+                    from: YOUR_844_NUMBER,
+                    to: phoneNumber
+                });
+                console.log(`Rescue text sent to customer (${phoneNumber}).`);
+
+                // SAVE TO REDIS (24h Expiry)
+                if (ownerPhone) {
+                    await redis.set(phoneNumber, ownerPhone, { ex: 86400 });
+                    console.log(`Saved pending rescue to Redis for ${phoneNumber}.`);
+                }
+
+            } catch (e) {
+                console.error("Error sending rescue text:", e);
+            }
         }
     }
+
     res.sendStatus(200);
 });
 
 app.listen(process.env.PORT || 3000, () => console.log('Lead Engine Online.'));
+
+// NEW: Handle SMS Replies
+app.post('/twilio-sms-reply', async (req, res) => {
+    const customerMsg = req.body.Body;
+    const customerPhone = req.body.From;
+
+    console.log(`Received SMS from ${customerPhone}: ${customerMsg}`);
+
+    // 1. Lookup Owner in Redis
+    const ownerPhone = await redis.get(customerPhone);
+
+    if (!ownerPhone) {
+        console.log("No pending rescue found for this number.");
+        return res.sendStatus(200);
+    }
+
+    // 2. Ask OpenAI to extract address
+    try {
+        const completion = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [
+                { role: "system", content: "Extract the property address from the user's text. If no address is found, return 'NONE'. If found, return ONLY the address." },
+                { role: "user", content: customerMsg }
+            ]
+        });
+
+        const extractedAddress = completion.choices[0].message.content.trim();
+
+        if (extractedAddress !== "NONE") {
+            // 3. SUCCESS: Address Found
+
+            // Notify Owner
+            await client.messages.create({
+                body: `✅ SMS LEAD RECOVERY: Customer (${customerPhone}) provided address: ${extractedAddress}. Message: "${customerMsg}"`,
+                from: YOUR_844_NUMBER,
+                to: ownerPhone
+            });
+
+            // Confirm to Customer
+            await client.messages.create({
+                body: "Got it! I've passed that address to the owner. He'll reach out shortly.",
+                from: YOUR_844_NUMBER,
+                to: customerPhone
+            });
+
+            // Cleanup: Remove from Redis
+            await redis.del(customerPhone);
+
+            console.log(`Recovered lead sent to ${ownerPhone}. Record deleted.`);
+
+        } else {
+            // 4. FAIL: No Address Found
+            await client.messages.create({
+                body: "I didn't quite catch the address. Could you please text the street address so we can get that quote started?",
+                from: YOUR_844_NUMBER,
+                to: customerPhone
+            });
+            console.log("AI could not find address. Asked again.");
+        }
+
+    } catch (e) {
+        console.error("Error in SMS Reply Handler:", e);
+    }
+
+    res.sendStatus(200);
+});
