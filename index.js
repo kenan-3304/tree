@@ -46,8 +46,37 @@ app.post('/vapi-webhook', async (req, res) => {
 
     // Vapi sends "end-of-call-report" when the call finishes
     if (payload && payload.type === 'end-of-call-report') {
-        const analysis = payload.analysis || {};
-        const structuredData = analysis.structuredData || {};
+        // 1. TRY ARTIFACT (Python Logic Priority)
+        const artifact = payload.artifact || {};
+        const structuredOutputs = artifact.structuredOutputs || {};
+        let structuredData = {};
+
+        // Iterate values (Python: structured_outputs.values())
+        for (const key in structuredOutputs) {
+            const output = structuredOutputs[key];
+            if (output && ((output.name && output.name === "emergency_dossier") || "result" in output)) {
+                structuredData = output.result || {};
+                break;
+            }
+        }
+
+        // 2. FALLBACK TO ANALYSIS (Legacy/Standard)
+        if (Object.keys(structuredData).length === 0) {
+            const analysis = payload.analysis || {};
+            structuredData = analysis.structuredData || {};
+
+            // Handle nested UUID (Legacy Fix: "uuid": { "result": ... })
+            if (!structuredData.address) {
+                // Check if any key has a .result property
+                for (const key in structuredData) {
+                    if (structuredData[key] && structuredData[key].result) {
+                        structuredData = structuredData[key].result;
+                        break;
+                    }
+                }
+            }
+        }
+
         const callData = payload.call || {};
         const customer = callData.customer || {};
 
