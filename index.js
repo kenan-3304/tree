@@ -21,10 +21,17 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 // Hardcoded Values & Directory
 const YOUR_844_NUMBER = '+18443336529'; // Your Toll-Free (844) Number
 
-// Map Vapi Assistant IDs to Owner Phone Numbers
+const { validateAndCheckDistance } = require('./addressValidator');
+
+// Map Vapi Assistant IDs to Owner Data (Phone + Location)
 const COMPANY_DIRECTORY = {
-    // Extracted from Python example: 9337f242... -> 7037760484
-    "bb86db5d-7dcc-444f-bebd-0019265f857f": "+17037760484",
+    "bb86db5d-7dcc-444f-bebd-0019265f857f": {
+        ownerPhone: "+17037760484",
+        // TODO: UPDATE THESE COORDINATES WITH THE REAL BUSINESS ADDRESS
+        // Currently set to a central point in Fairfax, VA as a placeholder
+        serviceLocation: { lat: 38.8462, lng: -77.3064 },
+        radiusMiles: 50
+    },
     // Add more assistants here
 };
 
@@ -111,31 +118,78 @@ app.post('/vapi-webhook', async (req, res) => {
 
             // Determine Recipient based on Assistant ID
             const assistantId = callData.assistantId;
-            const ownerPhone = COMPANY_DIRECTORY[assistantId];
+            const companyData = COMPANY_DIRECTORY[assistantId];
 
-            if (ownerPhone) {
-                try {
-                    // Send details to the business owner
-                    await client.messages.create({
-                        body: leadSummary,
-                        from: YOUR_844_NUMBER,
-                        to: ownerPhone
-                    });
-                    console.log(`Success text sent to owner (${ownerPhone}).`);
-                } catch (e) {
-                    console.error("Error sending success text:", e);
+            if (companyData) {
+                // Perform Address Validation & Radius Check
+                const validationResult = await validateAndCheckDistance(
+                    address,
+                    companyData.serviceLocation,
+                    companyData.radiusMiles
+                );
+
+                if (validationResult.valid) {
+                    // SCENARIO A: SUCCESS - Valid & In Range
+                    const leadSummary = `✅ NEW LEAD: ${name} needs ${serviceType} at ${validationResult.formattedAddress}. Urgency: ${urgency}. Phone: ${phoneNumber}. Distance: ${validationResult.distanceMiles}mi.`;
+
+                    try {
+                        // Send details to the business owner
+                        await client.messages.create({
+                            body: leadSummary,
+                            from: YOUR_844_NUMBER,
+                            to: companyData.ownerPhone
+                        });
+                        console.log(`Success text sent to owner (${companyData.ownerPhone}).`);
+                    } catch (e) {
+                        console.error("Error sending success text:", e);
+                    }
+                } else {
+                    // SCENARIO C: OUT OF RANGE OR INVALID - Treat as rescue/clarification needed
+                    console.log(`Address validation failed: ${validationResult.reason} (Input: ${address})`);
+
+                    // Fallback to Rescue Flow (but maybe with specific message?)
+                    // For now, let's treat it like a missing address so we can confirm details via text
+                    // We can reuse the rescue logic below, or duplicate it. 
+                    // Let's modify the flow to falling through to rescue if validation fails?
+                    // actually, better to handle it explicitly here to avoid clutter.
+
+                    const issueMsg = validationResult.reason === "OUT_OF_SERVICE_AREA"
+                        ? `Hey! It looks like that address might be a bit far (${validationResult.distanceMiles} miles). Just to confirm, are you located at ${validationResult.formattedAddress}?`
+                        : "Hey! We couldn't quite verify that address. Could you text us your street address again so we can get you a quote?";
+
+                    try {
+                        await client.messages.create({
+                            body: issueMsg,
+                            from: YOUR_844_NUMBER,
+                            to: phoneNumber
+                        });
+                        console.log(`Validation issue text sent to customer (${phoneNumber}).`);
+
+                        // SAVE TO REDIS (24h Expiry)
+                        const redisValue = JSON.stringify({
+                            ownerPhone: companyData.ownerPhone,
+                            dialedNumber
+                        });
+                        await redis.set(phoneNumber, redisValue, { ex: 86400 });
+
+                    } catch (e) {
+                        console.error("Error sending validation issue text:", e);
+                    }
                 }
+
             } else {
                 console.log(`No owner found for Assistant ID: ${assistantId}`);
             }
         }
+
         // SCENARIO B: RESCUE - Address is missing
         else {
             const rescueMsg = "Hey! We missed the address on that call. Where is the tree located so we can get you a quote?";
 
             // Determine Recipient based on Assistant ID
             const assistantId = callData.assistantId;
-            const ownerPhone = COMPANY_DIRECTORY[assistantId];
+            const companyData = COMPANY_DIRECTORY[assistantId];
+            const ownerPhone = companyData ? companyData.ownerPhone : null;
 
             try {
                 // Send rescue text to the customer
