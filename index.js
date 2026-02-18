@@ -130,7 +130,8 @@ app.post('/vapi-webhook', async (req, res) => {
 
                 if (validationResult.valid) {
                     // SCENARIO A: SUCCESS - Valid & In Range
-                    const leadSummary = `✅ NEW LEAD: ${name} needs ${serviceType} at ${validationResult.formattedAddress}. Urgency: ${urgency}. Phone: ${phoneNumber}. Distance: ${validationResult.distanceMiles}mi.`;
+                    const mapsLink = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(validationResult.formattedAddress)}`;
+                    const leadSummary = `✅ NEW LEAD: ${name} needs ${serviceType} at ${validationResult.formattedAddress}. Urgency: ${urgency}. Phone: ${phoneNumber}. Distance: ${validationResult.distanceMiles}mi.\n\n📍 Map: ${mapsLink}`;
 
                     try {
                         // Send details to the business owner
