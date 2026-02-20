@@ -80,7 +80,8 @@ const handleVapiWebhook = async (req, res) => {
 
         // SCENARIO A: SUCCESS - We have an address
         if (address && address.length > 5) {
-            const leadSummary = `✅ NEW LEAD: ${name} needs ${serviceType} at ${address}. Urgency: ${urgency}. Phone: ${phoneNumber}. Called: ${dialedNumber}`;
+            const phoneDisplay = phoneNumber ? phoneNumber : "UNKNOWN (Caller ID Blocked)";
+            const leadSummary = `✅ NEW LEAD: ${name} needs ${serviceType} at ${address}. Urgency: ${urgency}. Phone: ${phoneDisplay}. Called: ${dialedNumber}`;
 
             // Determine Recipient based on Assistant ID
             const assistantId = callData.assistantId;
@@ -97,7 +98,8 @@ const handleVapiWebhook = async (req, res) => {
                 if (validationResult.valid) {
                     // SCENARIO A: SUCCESS - Valid & In Range
                     const mapsLink = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(validationResult.formattedAddress)}`;
-                    const leadSummary = `✅ NEW LEAD: ${name} needs ${serviceType} at ${validationResult.formattedAddress}. Urgency: ${urgency}. Phone: ${phoneNumber}. Distance: ${validationResult.distanceMiles}mi.\n\n📍 Map: ${mapsLink}`;
+                    const phoneDisplay = phoneNumber ? phoneNumber : "UNKNOWN (Caller ID Blocked)";
+                    const leadSummary = `✅ NEW LEAD: ${name} needs ${serviceType} at ${validationResult.formattedAddress}. Urgency: ${urgency}. Phone: ${phoneDisplay}. Distance: ${validationResult.distanceMiles}mi.\n\n📍 Map: ${mapsLink}`;
 
                     try {
                         // Send details to the business owner
@@ -115,26 +117,30 @@ const handleVapiWebhook = async (req, res) => {
                     console.log(`Address validation failed: ${validationResult.reason} (Input: ${address})`);
 
                     const issueMsg = validationResult.reason === "OUT_OF_SERVICE_AREA"
-                        ? `Hey! It looks like that address might be a bit far (${validationResult.distanceMiles} miles). Just to confirm, are you located at ${validationResult.formattedAddress}?`
-                        : "Hey! We couldn't quite verify that address. Could you text us your street address again so we can get you a quote?";
+                        ? `Hey! It looks like that address might be a bit far (${validationResult.distanceMiles} miles). Just to confirm, are you located at ${validationResult.formattedAddress}? Reply STOP to unsubscribe.`
+                        : "Hey! We couldn't quite verify that address. Could you text us your street address again so we can get you a quote? Reply STOP to unsubscribe.";
 
-                    try {
-                        await client.messages.create({
-                            body: issueMsg,
-                            from: YOUR_844_NUMBER,
-                            to: phoneNumber
-                        });
-                        console.log(`Validation issue text sent to customer (${phoneNumber}).`);
+                    if (phoneNumber) {
+                        try {
+                            await client.messages.create({
+                                body: issueMsg,
+                                from: YOUR_844_NUMBER,
+                                to: phoneNumber
+                            });
+                            console.log(`Validation issue text sent to customer (${phoneNumber}).`);
 
-                        // SAVE TO REDIS (24h Expiry)
-                        const redisValue = JSON.stringify({
-                            ownerPhone: companyData.ownerPhone,
-                            dialedNumber
-                        });
-                        await redis.set(phoneNumber, redisValue, { ex: 86400 });
+                            // SAVE TO REDIS (24h Expiry)
+                            const redisValue = JSON.stringify({
+                                ownerPhone: companyData.ownerPhone,
+                                dialedNumber
+                            });
+                            await redis.set(phoneNumber, redisValue, { ex: 86400 });
 
-                    } catch (e) {
-                        console.error("Error sending validation issue text:", e);
+                        } catch (e) {
+                            console.error("Error sending validation issue text:", e);
+                        }
+                    } else {
+                        console.log("Could not send validation issue text: Missing customer phone number.");
                     }
                 }
 
@@ -145,32 +151,46 @@ const handleVapiWebhook = async (req, res) => {
 
         // SCENARIO B: RESCUE - Address is missing
         else {
-            const rescueMsg = "Hey! We missed the address on that call. Where is the tree located so we can get you a quote?";
+            const rescueMsg = "Hey! We missed the address on that call. Where is the tree located so we can get you a quote? Reply STOP to unsubscribe.";
 
             // Determine Recipient based on Assistant ID
             const assistantId = callData.assistantId;
             const companyData = COMPANY_DIRECTORY[assistantId];
             const ownerPhone = companyData ? companyData.ownerPhone : null;
 
-            try {
-                // Send rescue text to the customer
-                await client.messages.create({
-                    body: rescueMsg,
-                    from: YOUR_844_NUMBER,
-                    to: phoneNumber
-                });
-                console.log(`Rescue text sent to customer (${phoneNumber}).`);
+            if (phoneNumber) {
+                try {
+                    // Send rescue text to the customer
+                    await client.messages.create({
+                        body: rescueMsg,
+                        from: YOUR_844_NUMBER,
+                        to: phoneNumber
+                    });
+                    console.log(`Rescue text sent to customer (${phoneNumber}).`);
 
-                // SAVE TO REDIS (24h Expiry)
-                if (ownerPhone) {
-                    // Store as JSON to include dialed number for tracking
-                    const redisValue = JSON.stringify({ ownerPhone, dialedNumber });
-                    await redis.set(phoneNumber, redisValue, { ex: 86400 });
-                    console.log(`Saved pending rescue to Redis for ${phoneNumber} (Owner: ${ownerPhone}, Dialed: ${dialedNumber}).`);
+                    // SAVE TO REDIS (24h Expiry)
+                    if (ownerPhone) {
+                        // Store as JSON to include dialed number for tracking
+                        const redisValue = JSON.stringify({ ownerPhone, dialedNumber });
+                        await redis.set(phoneNumber, redisValue, { ex: 86400 });
+                        console.log(`Saved pending rescue to Redis for ${phoneNumber} (Owner: ${ownerPhone}, Dialed: ${dialedNumber}).`);
+                    }
+
+                } catch (e) {
+                    console.error("Error sending rescue text:", e);
                 }
-
-            } catch (e) {
-                console.error("Error sending rescue text:", e);
+            } else {
+                console.log("Could not send rescue text: Missing customer phone number.");
+                // We could still notify the owner that a lead came in with no address/phone:
+                if (ownerPhone && name !== 'Unknown') {
+                    try {
+                        await client.messages.create({
+                            body: `⚠️ UNRECOVERABLE LEAD: Someone named ${name} called needing a quote, but they hung up before giving an address, AND their Caller ID was blocked. We cannot follow up.`,
+                            from: YOUR_844_NUMBER,
+                            to: ownerPhone
+                        });
+                    } catch (e) { console.error(e); }
+                }
             }
         }
     }

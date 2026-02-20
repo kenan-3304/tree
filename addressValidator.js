@@ -67,8 +67,8 @@ async function validateAndCheckDistance(address, providerLocation, maxRadiusMile
 
         // 2. Get Geolocation
         const location = result.geocode?.location;
-        if (!location) {
-            return { valid: false, reason: "NO_LOCATION_FOUND", formattedAddress: result.address?.formattedAddress };
+        if (!location || typeof location.latitude !== 'number' || typeof location.longitude !== 'number') {
+            return { valid: false, reason: "NO_COORDINATES_FOUND", formattedAddress: result.address?.formattedAddress };
         }
 
         // 3. Radius Check

@@ -33,7 +33,16 @@ const handleSmsReply = async (req, res) => {
         }
     }
 
-    // 2. Ask OpenAI to extract address
+    // 2. Short-circuit for manual Unsubscribe/STOP
+    const stopWords = ["stop", "cancel", "unsubscribe", "quit", "no", "end"];
+    if (stopWords.includes(customerMsg.toLowerCase().trim())) {
+        console.log(`Manual STOP request from ${customerPhone}. Cleaning up Redis.`);
+        await redis.del(customerPhone);
+        return res.sendStatus(200);
+        // Twilio handles the actual network blocking automatically when it sees "STOP"
+    }
+
+    // 3. Ask OpenAI to extract address
     try {
         const completion = await openai.chat.completions.create({
             model: "gpt-4o-mini",
